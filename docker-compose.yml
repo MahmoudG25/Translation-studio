@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  translation-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: translation-studio
+    
+    # GPU support (uncomment if using NVIDIA GPU)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    # Environment variables
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - WHISPER_MODEL=medium
+      - PYTHONUNBUFFERED=1
+      - TORCH_HOME=/app/cache
+      - HF_HOME=/app/cache
+    
+    # Volume mounts for input/output
+    volumes:
+      - ./videos:/app/videos
+      - ./output:/app/output
+      - ./cache:/app/cache
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    
+    # Display configuration for GUI (Linux)
+    environment:
+      - DISPLAY=${DISPLAY:-}
+    
+    # Network settings
+    networks:
+      - translation-network
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits
+    mem_limit: 8g
+    cpus: '4'
+
+networks:
+  translation-network:
+    driver: bridge
+
+volumes:
+  cache:
+    driver: local

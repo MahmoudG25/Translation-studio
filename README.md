@@ -11,7 +11,14 @@ Professional desktop application for translating videos, audio files, and SRT su
 - **SRT → Arabic** using Argos Translate (completely offline)
 - **SRT → Arabic** using ChatGPT API (online, highest quality)
 
-🚀 **Key Capabilities**
+� **BATCH PROCESSING (NEW!)**
+- **Translate multiple files simultaneously** with configurable parallel jobs (1-4)
+- **Queue management** with real-time progress tracking
+- **Multiple engine support** - Batch with Argos or ChatGPT
+- **Automatic retry** - Continue even if individual files fail
+- **Color-coded status** - Easily track pending, running, completed, and failed jobs
+
+�🚀 **Key Capabilities**
 - Extract audio from video files and transcribe using Whisper
 - Convert transcriptions to SRT subtitle format
 - Preserve code snippets and technical terms during translation
@@ -117,6 +124,34 @@ python main.py
 6. Output: `your_file.ar.srt`
 
 **Requirements:** OpenAI API key with available credits
+
+#### Option 4: Batch Translation (NEW!)
+Process multiple files simultaneously:
+
+1. Click the **"Batch Mode"** tab
+2. Select translation engine:
+   - **Argos (Offline)** - Fast, no API costs, no internet
+   - **ChatGPT (Online)** - Best quality, requires API key
+3. Set parallel jobs (1-4):
+   - **1** = Sequential (safe for all systems)
+   - **2** = Default (recommended)
+   - **3-4** = Parallel processing (high-end systems)
+4. Click **"📂 Select SRT Files"** and choose multiple files
+5. Files appear in queue with status indicators
+6. Click **"▶️ Start Processing"**
+7. Watch real-time progress:
+   - ⏳ Pending (gray) - Waiting
+   - ⚙️ Running (blue) - Processing
+   - ✓ Completed (green) - Done
+   - ✗ Failed (red) - Error
+
+**Features:**
+- Translates multiple files at same time
+- Continue if one file fails
+- Real-time progress per file
+- Automatic output naming (`.ar.srt`)
+
+**See [BATCH_PROCESSING.md](BATCH_PROCESSING.md) for detailed batch mode guide**
 
 ## Docker Setup
 

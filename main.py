@@ -16,10 +16,11 @@ from typing import List, Dict, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QProgressBar, QComboBox, QLineEdit, QTextEdit
+    QFileDialog, QProgressBar, QComboBox, QLineEdit, QTextEdit, QListWidget,
+    QListWidgetItem, QSpinBox, QTabWidget
 )
-from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
+from PySide6.QtGui import QFont, QColor
 
 # Try importing optional libraries with graceful fallbacks
 try:
@@ -40,6 +41,10 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+
+# Import batch processing modules
+from batch_processor import TranslationEngineType, TranslationStatus, TranslationJob
+from simple_batch import SimpleBatchProcessor
 
 
 # ===================== UTILITIES =====================
@@ -83,13 +88,12 @@ class CodeDetector:
     """Detect and protect code snippets and technical terms."""
 
     PATTERNS = [
-        r"[{}();<>[\]|]",  # Code brackets
-        r"\b(def|class|function|return|if|else|for|while|try|except|import|from|async|await)\b",
+        r"[{}<>[\]|]",  # Code brackets (removed () as they are common in text)
+        r"\b(def|function|async|await|const|var|val|let)\b",  # Strict keywords only
         r"=>\s*|::\s*",  # Arrow functions, scope resolution
-        r"\w+\.\w+\(",  # Method calls
-        r"console\.|print\(|log\(",  # Console/print statements
+        r"(console\.|print\(|log\()",  # Console/print statements
         r"^\s*#|^\s*//",  # Comments
-        r"\$\w+|\b\w+\s*=\s*",  # Variables
+        r"\$\w+",  # Variables (removed generic assignment to avoid false positives)
         r"`[^`]+`",  # Code blocks
     ]
 
@@ -103,6 +107,61 @@ class CodeDetector:
             if re.search(pattern, text):
                 return True
         return False
+
+
+class TranslationValidator:
+    """Validate that all subtitles have been properly translated."""
+
+    @staticmethod
+    def validate_translation(subtitles: List[Dict[str, str]], original_subtitles: List[Dict[str, str]]) -> Dict:
+        """
+        Validate translation quality and completeness.
+        
+        Args:
+            subtitles: Translated subtitles
+            original_subtitles: Original subtitles (before translation)
+            
+        Returns:
+            Validation report with issues found
+        """
+        report = {
+            "total": len(subtitles),
+            "empty": 0,
+            "unchanged": 0,
+            "issues": []
+        }
+        
+        if len(subtitles) != len(original_subtitles):
+            report["issues"].append(f"Subtitle count mismatch: {len(original_subtitles)} original vs {len(subtitles)} translated")
+        
+        for i, (trans, orig) in enumerate(zip(subtitles, original_subtitles)):
+            # Check for empty translations
+            if not trans['text'].strip():
+                report["empty"] += 1
+                report["issues"].append(f"Subtitle {i+1}: Empty translation")
+            
+            # Check if translation is identical to original (likely untranslated)
+            elif trans['text'].strip() == orig['text'].strip():
+                report["unchanged"] += 1
+        
+        return report
+    
+    @staticmethod
+    def report_validation(report: Dict) -> str:
+        """Generate human-readable validation report."""
+        msg = f"Translation Validation Report:\n"
+        msg += f"  Total subtitles: {report['total']}\n"
+        msg += f"  Empty translations: {report['empty']}\n"
+        msg += f"  Unchanged from original: {report['unchanged']}\n"
+        
+        if report["issues"]:
+            msg += f"\nIssues found ({len(report['issues'])}):\n"
+            for issue in report["issues"][:10]:  # Show first 10 issues
+                msg += f"  - {issue}\n"
+            if len(report["issues"]) > 10:
+                msg += f"  ... and {len(report['issues']) - 10} more issues\n"
+        
+        return msg
 
 
 class FFmpegHandler:
@@ -238,17 +297,26 @@ class WhisperTranslateThread(QThread):
                             except Exception:
                                 pass  # Ignore if this fails
                             
+                            translated_count = 0
                             for i, subtitle in enumerate(subtitles):
                                 if not CodeDetector.is_code_or_technical(subtitle['text']):
                                     try:
+                                        original_text = subtitle['text']
                                         translated = translate.translate(subtitle['text'], "en", "ar")
-                                        subtitle['text'] = translated
+                                        # Validate that translation is not empty
+                                        if translated and len(translated.strip()) > 0:
+                                            subtitle['text'] = translated
+                                            translated_count += 1
+                                        else:
+                                            # Keep original if translation resulted in empty text
+                                            self.status_update.emit(f"⚠ Subtitle {i+1}: Translation resulted in empty, kept original")
                                     except Exception as e:
                                         # Keep original if translation fails
-                                        pass
+                                        self.status_update.emit(f"⚠ Subtitle {i+1} translation error: {str(e)[:50]}")
                                 
                                 progress = 60 + int((i + 1) / total * 20)
                                 self.progress_update.emit(progress)
+                            self.status_update.emit(f"✓ Translated {translated_count}/{total} subtitles to Arabic")
                         except Exception as e:
                             self.status_update.emit(f"⚠ Translation to Arabic unavailable: {str(e)}")
                     else:
@@ -266,7 +334,10 @@ class WhisperTranslateThread(QThread):
                     f.write(srt_content)
 
                 self.progress_update.emit(100)
-                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)}")
+                translated_segments = SRTParser.parse(srt_content)
+                # Count translated segments (non-empty)
+                translated_count = sum(1 for s in translated_segments if s['text'].strip())
+                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Translated: {translated_count}/{total})")
 
             finally:
                 # Cleanup temporary audio file
@@ -350,17 +421,27 @@ class ArgosTranslateThread(QThread):
             self.progress_update.emit(30)
 
             # Translate each subtitle
+            translated_count = 0
             for i, subtitle in enumerate(subtitles):
                 if not CodeDetector.is_code_or_technical(subtitle['text']):
                     try:
+                        original_text = subtitle['text']
                         translated = translate.translate(subtitle['text'], "en", "ar")
-                        subtitle['text'] = translated
+                        # Validate translation output - never leave blank
+                        if translated and len(translated.strip()) > 0:
+                            subtitle['text'] = translated
+                            translated_count += 1
+                        else:
+                            # If translation returned empty, keep original and log
+                            self.status_update.emit(f"⚠ Subtitle {i+1}: Translation resulted in empty text, keeping original")
                     except Exception as e:
-                        # Keep original if translation fails
-                        pass
+                        # Keep original if translation fails - log the issue
+                        self.status_update.emit(f"⚠ Subtitle {i+1} translation error: {str(e)[:50]}")
 
                 progress = 30 + int((i + 1) / total * 70)
                 self.progress_update.emit(progress)
+            
+            self.status_update.emit(f"✓ Translated {translated_count}/{total} subtitles to Arabic")
 
             # Save translated SRT
             output_path = self.srt_path.replace('.srt', '.ar.srt')
@@ -370,7 +451,7 @@ class ArgosTranslateThread(QThread):
                 f.write(output_content)
 
             self.progress_update.emit(100)
-            self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)}")
+            self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Translated: {translated_count}/{total})")
 
         except Exception as e:
             self.translation_finished.emit(f"✗ Error: {str(e)}")
@@ -438,12 +519,13 @@ Output ONLY the translated text, nothing else."""
             # Translate each subtitle
             for i, subtitle in enumerate(subtitles):
                 text_to_translate = subtitle['text'].strip()
+                original_text = subtitle['text']  # Save original before any modification
                 
-                # Skip if text is empty or is pure code/technical
+                # Skip if text is empty - strict code checking is DISABLED for generic AI models as they handle context better
                 if not text_to_translate:
                     self.skipped_count += 1
-                elif CodeDetector.is_code_or_technical(text_to_translate):
-                    self.skipped_count += 1
+                # elif CodeDetector.is_code_or_technical(text_to_translate):
+                #     self.skipped_count += 1
                 else:
                     try:
                         # Call ChatGPT with modern API
@@ -459,21 +541,30 @@ Output ONLY the translated text, nothing else."""
                         
                         if response.choices and len(response.choices) > 0:
                             translated = response.choices[0].message.content.strip()
-                            if translated:
+                            # IMPORTANT: Never leave text blank - fallback to original if translation fails
+                            if translated and len(translated) > 0:
                                 subtitle['text'] = translated
                                 self.translated_count += 1
                             else:
+                                # Fallback: keep original text to avoid losing content
+                                subtitle['text'] = original_text
+                                self.status_update.emit(f"⚠ Subtitle {i+1}: Empty response, kept original text")
                                 self.skipped_count += 1
                         else:
+                            # No response received - keep original text
+                            subtitle['text'] = original_text
+                            self.status_update.emit(f"⚠ Subtitle {i+1}: No response received, kept original text")
                             self.skipped_count += 1
                             
                     except Exception as e:
                         error_msg = str(e)
+                        # IMPORTANT: Keep original text on any error to ensure no data loss
+                        subtitle['text'] = original_text
                         # Provide helpful error diagnostics
                         if "model_not_found" in error_msg or "does not have access" in error_msg:
                             self.status_update.emit(f"⚠ Model '{self.model}' not available. Try: gpt-4, gpt-4-turbo, gpt-4o, gpt-4o-mini")
                         else:
-                            self.status_update.emit(f"⚠ API Error: {error_msg[:100]}")
+                            self.status_update.emit(f"⚠ API Error for subtitle {i+1}: {error_msg[:100]}")
                         self.skipped_count += 1
 
                 progress = 20 + int((i + 1) / total * 75)
@@ -500,37 +591,64 @@ Output ONLY the translated text, nothing else."""
 # ===================== GUI APPLICATION =====================
 
 class TranslatorApp(QWidget):
-    """Main GUI application for translation."""
+    """Main GUI application for translation with batch processing support."""
 
     def __init__(self):
         super().__init__()
-        self.init_ui()
         self.thread = None
+        self.batch_processor = None  # Will be created when needed
+        self.batch_jobs = []  # List of jobs to process
+        self.batch_manager = None
+        self.current_engine = None
+        self.init_ui()
+
+    def closeEvent(self, event):
+        """Handle application close event - clean up threads."""
+        self.cleanup_threads()
+        event.accept()
+
+    def cleanup_threads(self):
+        """Properly clean up all running threads."""
+        # Stop batch manager if running
+        if self.batch_manager and self.batch_manager.isRunning():
+            self.batch_manager.stop()
+            self.batch_manager.wait(timeout=5000)  # Wait up to 5 seconds
+
+        # Stop single file translation thread if running
+        if self.thread and self.thread.isRunning():
+            self.thread.wait(timeout=5000)
 
     def init_ui(self):
         """Initialize UI components."""
-        self.setWindowTitle("Translation Studio - Video/Audio/SRT to Arabic")
-        self.setGeometry(100, 100, 550, 750)
+        self.setWindowTitle("Translation Studio - Batch Translation to Arabic")
+        self.setGeometry(100, 100, 900, 900)
 
         main_layout = QVBoxLayout()
 
         # ===== Header with Author =====
-        header_label = QLabel("Translation Studio")
+        header_label = QLabel("Translation Studio - Batch Processing")
         header_label.setFont(QFont("Arial", 14, QFont.Bold))
         main_layout.addWidget(header_label)
         
-        author_label = QLabel("Made by Mahmoud Gado")
+        author_label = QLabel("Made by Mahmoud Gado | Batch Mode Enabled")
         author_label.setFont(QFont("Arial", 9))
         author_label.setStyleSheet("color: gray;")
         main_layout.addWidget(author_label)
         
-        separator = QLabel("─" * 60)
+        separator = QLabel("─" * 100)
         main_layout.addWidget(separator)
 
-        # ===== Video Translation Section =====
+        # Create tabs for single and batch mode
+        self.tabs = QTabWidget()
+        
+        # ===== SINGLE FILE TAB =====
+        single_widget = QWidget()
+        single_layout = QVBoxLayout()
+        
+        # Video Translation Section
         video_title = QLabel("🎥 VIDEO/AUDIO TRANSLATION (Whisper - Offline)")
         video_title.setFont(QFont("Arial", 11, QFont.Bold))
-        main_layout.addWidget(video_title)
+        single_layout.addWidget(video_title)
 
         video_layout = QHBoxLayout()
         self.video_btn = QPushButton("Select Video File")
@@ -540,21 +658,21 @@ class TranslatorApp(QWidget):
         video_layout.addWidget(self.video_btn)
         video_layout.addWidget(QLabel("Model:"))
         video_layout.addWidget(self.video_model_combo)
-        main_layout.addLayout(video_layout)
+        single_layout.addLayout(video_layout)
 
-        # ===== SRT Translation Section - Argos =====
+        # SRT Translation Section - Argos
         srt_argos_title = QLabel("📝 SRT TRANSLATION - OFFLINE (Argos Translate)")
         srt_argos_title.setFont(QFont("Arial", 11, QFont.Bold))
-        main_layout.addWidget(srt_argos_title)
+        single_layout.addWidget(srt_argos_title)
 
         self.srt_argos_btn = QPushButton("Select SRT File (Argos)")
         self.srt_argos_btn.clicked.connect(self.select_srt_argos)
-        main_layout.addWidget(self.srt_argos_btn)
+        single_layout.addWidget(self.srt_argos_btn)
 
-        # ===== SRT Translation Section - ChatGPT =====
+        # SRT Translation Section - ChatGPT
         srt_chatgpt_title = QLabel("📝 SRT TRANSLATION - ONLINE (ChatGPT)")
         srt_chatgpt_title.setFont(QFont("Arial", 11, QFont.Bold))
-        main_layout.addWidget(srt_chatgpt_title)
+        single_layout.addWidget(srt_chatgpt_title)
 
         srt_chatgpt_layout = QHBoxLayout()
         self.srt_chatgpt_btn = QPushButton("Select SRT File (ChatGPT)")
@@ -564,18 +682,111 @@ class TranslatorApp(QWidget):
         srt_chatgpt_layout.addWidget(self.srt_chatgpt_btn)
         srt_chatgpt_layout.addWidget(QLabel("Model:"))
         srt_chatgpt_layout.addWidget(self.chatgpt_model_combo)
-        main_layout.addLayout(srt_chatgpt_layout)
+        single_layout.addLayout(srt_chatgpt_layout)
 
         # API Key input
         self.api_key_label = QLabel("OpenAI API Key:")
-        main_layout.addWidget(self.api_key_label)
+        single_layout.addWidget(self.api_key_label)
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.Password)
         self.api_key_input.setPlaceholderText("sk-...")
-        main_layout.addWidget(self.api_key_input)
+        single_layout.addWidget(self.api_key_input)
 
-        # ===== Progress and Status =====
-        separator = QLabel("─" * 60)
+        single_layout.addStretch()
+        single_widget.setLayout(single_layout)
+        self.tabs.addTab(single_widget, "Single File")
+
+        # ===== BATCH MODE TAB =====
+        batch_widget = QWidget()
+        batch_layout = QVBoxLayout()
+
+        # Batch controls
+        batch_title = QLabel("📦 BATCH TRANSLATION MODE")
+        batch_title.setFont(QFont("Arial", 11, QFont.Bold))
+        batch_layout.addWidget(batch_title)
+
+        # Engine selection
+        engine_layout = QHBoxLayout()
+        engine_layout.addWidget(QLabel("Select Engine:"))
+        self.batch_engine_combo = QComboBox()
+        self.batch_engine_combo.addItems(["Argos (Offline)", "ChatGPT (Online)"])
+        engine_layout.addWidget(self.batch_engine_combo)
+        engine_layout.addStretch()
+        batch_layout.addLayout(engine_layout)
+
+        # ChatGPT model selection (shown when ChatGPT selected)
+        self.batch_chatgpt_model_widget = QWidget()
+        self.batch_chatgpt_model_layout = QHBoxLayout()
+        self.batch_chatgpt_model_layout.addWidget(QLabel("ChatGPT Model:"))
+        self.batch_chatgpt_model_combo = QComboBox()
+        self.batch_chatgpt_model_combo.addItems(["gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"])
+        self.batch_chatgpt_model_layout.addWidget(self.batch_chatgpt_model_combo)
+        self.batch_chatgpt_model_layout.addStretch()
+        self.batch_chatgpt_model_widget.setLayout(self.batch_chatgpt_model_layout)
+        batch_layout.addWidget(self.batch_chatgpt_model_widget)
+        self.batch_chatgpt_model_widget.setVisible(False)
+
+        # API key for batch ChatGPT
+        self.batch_api_key_label = QLabel("OpenAI API Key:")
+        batch_layout.addWidget(self.batch_api_key_label)
+        self.batch_api_key_input = QLineEdit()
+        self.batch_api_key_input.setEchoMode(QLineEdit.Password)
+        self.batch_api_key_input.setPlaceholderText("sk-...")
+        batch_layout.addWidget(self.batch_api_key_input)
+        self.batch_api_key_label.setVisible(False)
+        self.batch_api_key_input.setVisible(False)
+
+        # Parallel jobs control
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("Parallel Jobs:"))
+        self.parallel_jobs_spin = QSpinBox()
+        self.parallel_jobs_spin.setMinimum(1)
+        self.parallel_jobs_spin.setMaximum(4)
+        self.parallel_jobs_spin.setValue(2)
+        parallel_layout.addWidget(self.parallel_jobs_spin)
+        parallel_layout.addStretch()
+        batch_layout.addLayout(parallel_layout)
+
+        # File selection buttons
+        file_button_layout = QHBoxLayout()
+        self.batch_select_files_btn = QPushButton("📂 Select SRT Files")
+        self.batch_select_files_btn.clicked.connect(self.batch_select_files)
+        file_button_layout.addWidget(self.batch_select_files_btn)
+
+        self.batch_clear_btn = QPushButton("🗑️  Clear Queue")
+        self.batch_clear_btn.clicked.connect(self.batch_clear_queue)
+        file_button_layout.addWidget(self.batch_clear_btn)
+        batch_layout.addLayout(file_button_layout)
+
+        # Queue display
+        self.batch_queue_list = QListWidget()
+        self.batch_queue_list.setMaximumHeight(200)
+        batch_layout.addWidget(QLabel("📋 Translation Queue:"))
+        batch_layout.addWidget(self.batch_queue_list)
+
+        # Batch controls
+        control_layout = QHBoxLayout()
+        self.batch_start_btn = QPushButton("▶️  Start Processing")
+        self.batch_start_btn.clicked.connect(self.batch_start_processing)
+        control_layout.addWidget(self.batch_start_btn)
+
+        self.batch_stop_btn = QPushButton("⏹️  Stop Processing")
+        self.batch_stop_btn.setEnabled(False)
+        self.batch_stop_btn.clicked.connect(self.batch_stop_processing)
+        control_layout.addWidget(self.batch_stop_btn)
+        batch_layout.addLayout(control_layout)
+
+        batch_layout.addStretch()
+        batch_widget.setLayout(batch_layout)
+        self.tabs.addTab(batch_widget, "Batch Mode")
+
+        # Connect batch engine combo
+        self.batch_engine_combo.currentTextChanged.connect(self.update_batch_ui)
+
+        main_layout.addWidget(self.tabs)
+
+        # ===== Progress and Status (Common) =====
+        separator = QLabel("─" * 100)
         main_layout.addWidget(separator)
 
         self.progress = QProgressBar()
@@ -594,6 +805,383 @@ class TranslatorApp(QWidget):
         main_layout.addWidget(self.log_area)
 
         self.setLayout(main_layout)
+
+    def update_batch_ui(self):
+        """Update batch UI based on selected engine."""
+        is_chatgpt = "ChatGPT" in self.batch_engine_combo.currentText()
+        self.batch_chatgpt_model_widget.setVisible(is_chatgpt)
+        self.batch_api_key_label.setVisible(is_chatgpt)
+        self.batch_api_key_input.setVisible(is_chatgpt)
+
+    def batch_select_files(self):
+        """Select multiple SRT files for batch processing."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select SRT Files for Batch Processing",
+            "",
+            "SRT Files (*.srt);;All Files (*)"
+        )
+
+        if file_paths:
+            engine = "chatgpt" if "ChatGPT" in self.batch_engine_combo.currentText() else "argos"
+            
+            config = {}
+            if engine == "chatgpt":
+                api_key = self.batch_api_key_input.text().strip()
+                if not api_key:
+                    self.log_area.append("[Batch] ✗ Error: API key required for ChatGPT")
+                    return
+                config["api_key"] = api_key
+                config["model"] = self.batch_chatgpt_model_combo.currentText()
+
+            # Create translation jobs
+            from batch_processor import TranslationEngineType as EngineType
+            
+            self.batch_jobs = []
+            engine_type = EngineType.CHATGPT if engine == "chatgpt" else EngineType.ARGOS
+            
+            for file_path in file_paths:
+                if os.path.exists(file_path):
+                    job = TranslationJob(
+                        file_path=file_path,
+                        engine=engine_type,
+                        config=config
+                    )
+                    self.batch_jobs.append(job)
+                    self.log_area.append(f"[Batch] Added: {os.path.basename(file_path)}")
+            
+            self.log_area.append(f"[Batch] ✓ Ready to translate {len(self.batch_jobs)} file(s)")
+            self.refresh_batch_queue_display()
+
+    def batch_clear_queue(self):
+        """Clear the batch processing queue."""
+        self.batch_jobs.clear()
+        self.batch_queue_list.clear()
+        self.log_area.append("[Batch] Queue cleared")
+
+    def refresh_batch_queue_display(self):
+        """Update batch queue list display."""
+        self.batch_queue_list.clear()
+        
+        for job in self.batch_jobs:
+            filename = os.path.basename(job.file_path)
+            status_icon = {
+                TranslationStatus.PENDING: "⏳",
+                TranslationStatus.RUNNING: "⚙️",
+                TranslationStatus.COMPLETED: "✓",
+                TranslationStatus.FAILED: "✗",
+                TranslationStatus.SKIPPED: "⊘"
+            }.get(job.status, "❓")
+
+            item_text = f"{status_icon} {filename} | {job.engine.value.upper()} | {job.progress}%"
+            
+            item = QListWidgetItem(item_text)
+            
+            # Color code by status
+            if job.status == TranslationStatus.COMPLETED:
+                item.setForeground(QColor("green"))
+            elif job.status == TranslationStatus.RUNNING:
+                item.setForeground(QColor("blue"))
+            elif job.status == TranslationStatus.FAILED:
+                item.setForeground(QColor("red"))
+            elif job.status == TranslationStatus.PENDING:
+                item.setForeground(QColor("gray"))
+
+            self.batch_queue_list.addItem(item)
+
+    def batch_start_processing(self):
+        """Start batch translation processing."""
+        if not self.batch_jobs:
+            self.log_area.append("[Batch] ✗ Error: No files in queue")
+            return
+
+        self.batch_select_files_btn.setEnabled(False)
+        self.batch_clear_btn.setEnabled(False)
+        self.batch_start_btn.setEnabled(False)
+        self.batch_stop_btn.setEnabled(True)
+        self.batch_engine_combo.setEnabled(False)
+        self.parallel_jobs_spin.setEnabled(False)
+
+        self.log_area.append(f"[Batch] ▶️ Starting translation of {len(self.batch_jobs)} file(s)...")
+
+        # Determine which executor to use
+        engine_text = self.batch_engine_combo.currentText()
+        if "ChatGPT" in engine_text:
+            executor = self.execute_chatgpt_batch_job
+        else:
+            executor = self.execute_argos_batch_job
+
+        # Create and start the batch processor
+        self.batch_manager = SimpleBatchProcessor(self.batch_jobs, executor)
+        
+        # Connect signals
+        self.batch_manager.job_started.connect(self.on_batch_job_started)
+        self.batch_manager.job_progress.connect(self.on_batch_job_progress)
+        self.batch_manager.job_completed.connect(self.on_batch_job_completed)
+        self.batch_manager.job_failed.connect(self.on_batch_job_failed)
+        self.batch_manager.batch_progress.connect(self.on_batch_progress)
+        self.batch_manager.batch_finished.connect(self.on_batch_finished)
+        self.batch_manager.start()
+
+    def batch_stop_processing(self):
+        """Stop batch translation."""
+        if self.batch_manager and self.batch_manager.isRunning():
+            self.batch_manager.stop()
+            self.batch_manager.wait(timeout=5000)  # Wait up to 5 seconds for thread to finish
+        self.batch_reset_ui()
+        self.log_area.append("[Batch] ⏹️ Processing stopped")
+
+    def batch_reset_ui(self):
+        """Reset batch UI after processing."""
+        self.batch_select_files_btn.setEnabled(True)
+        self.batch_clear_btn.setEnabled(True)
+        self.batch_start_btn.setEnabled(True)
+        self.batch_stop_btn.setEnabled(False)
+        self.batch_engine_combo.setEnabled(True)
+        self.parallel_jobs_spin.setEnabled(True)
+
+    def on_batch_job_started(self, job_id: str):
+        """Handle batch job start."""
+        # Find the job with this ID in our batch_jobs list
+        job = None
+        for j in self.batch_jobs:
+            if j.job_id == job_id:
+                job = j
+                break
+        
+        if job:
+            filename = os.path.basename(job.file_path)
+            self.log_area.append(f"[{job.engine.value.upper()}] Starting: {filename}")
+
+    def on_batch_job_progress(self, job_id: str, progress: int, message: str):
+        """Handle batch job progress."""
+        if message:
+            self.log_area.append(f"  {message}")
+        self.refresh_batch_queue_display()
+
+    def on_batch_job_completed(self, job_id: str, output_path: str):
+        """Handle batch job completion."""
+        # Find the job with this ID in our batch_jobs list
+        job = None
+        for j in self.batch_jobs:
+            if j.job_id == job_id:
+                job = j
+                break
+        
+        if job:
+            filename = os.path.basename(job.file_path)
+            output_name = os.path.basename(output_path) if output_path else "unknown"
+            self.log_area.append(f"[{job.engine.value.upper()}] Completed: {filename} -> {output_name}")
+        self.refresh_batch_queue_display()
+
+    def on_batch_job_failed(self, job_id: str, error_message: str):
+        """Handle batch job failure."""
+        # Find the job with this ID in our batch_jobs list
+        job = None
+        for j in self.batch_jobs:
+            if j.job_id == job_id:
+                job = j
+                break
+        
+        if job:
+            filename = os.path.basename(job.file_path)
+            self.log_area.append(f"[{job.engine.value.upper()}] Failed: {filename} - {error_message}")
+        self.refresh_batch_queue_display()
+
+    def on_batch_queue_updated(self, stats: dict):
+        """Handle queue statistics update."""
+        progress = self.batch_processor.queue.get_progress_summary()
+        percentage = progress.get("percentage", 0)
+        self.progress.setValue(percentage)
+        
+        completed = stats.get("completed", 0)
+        total = stats.get("total_jobs", 0)
+        active = stats.get("active", 0)
+        self.status_label.setText(f"Status: Batch Processing | Completed: {completed}/{total} | Active: {active}")
+
+    def on_batch_progress(self, stats: dict):
+        """Handle batch progress update."""
+        total = stats.get("total", 0)
+        completed = stats.get("completed", 0)
+        failed = stats.get("failed", 0)
+        current = stats.get("current", 0)
+        
+        if total > 0:
+            percentage = int((completed * 100) / total) if total > 0 else 0
+            self.progress.setValue(percentage)
+        
+        self.status_label.setText(f"Status: Batch Processing | {completed}/{total} completed | {failed} failed")
+
+    def on_batch_finished(self, final_stats: dict):
+        """Handle batch completion."""
+        total = final_stats.get("total", 0)
+        completed = final_stats.get("completed", 0)
+        failed = final_stats.get("failed", 0)
+        
+        self.log_area.append("\n" + "="*70)
+        self.log_area.append(f"[Batch] 🎉 All jobs completed!")
+        self.log_area.append(f"[Batch] Total: {total} | Completed: {completed} | Failed: {failed}")
+        self.log_area.append("="*70 + "\n")
+        
+        self.progress.setValue(100)
+        self.batch_reset_ui()
+
+    def on_batch_all_completed(self, final_stats: dict):
+        """Handle batch completion (legacy method)."""
+        # Redirect to new handler for backward compatibility
+        self.on_batch_finished(final_stats)
+
+    def execute_argos_batch_job(self, job) -> bool:
+        """Execute single Argos translation job."""
+        try:
+            if not ARGOS_AVAILABLE:
+                on_failed = job.config.get('_on_failed')
+                if on_failed:
+                    on_failed("Argos Translate not installed")
+                return False
+
+            on_progress = job.config.get('_on_progress', lambda *args: None)
+            on_completed = job.config.get('_on_completed', lambda *args: None)
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+
+            on_progress(20, "Preparing language packages...")
+
+            try:
+                package.update_package_index()
+            except Exception:
+                pass
+
+            on_progress(30, "Reading SRT file...")
+
+            with open(job.file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            subtitles = SRTParser.parse(content)
+            total = len(subtitles)
+
+            if total == 0:
+                on_failed("No subtitles found in file")
+                return False
+
+            on_progress(40, f"Translating {total} subtitles...")
+
+            for i, subtitle in enumerate(subtitles):
+                if not CodeDetector.is_code_or_technical(subtitle['text']):
+                    try:
+                        translated = translate.translate(subtitle['text'], "en", "ar")
+                        subtitle['text'] = translated
+                    except Exception:
+                        pass
+
+                progress = 40 + int((i + 1) / total * 55)
+                on_progress(progress, f"Translated {i+1}/{total}")
+
+            on_progress(95, "Saving file...")
+
+            output_path = job.file_path.replace('.srt', '.ar.srt')
+            output_content = SRTParser.format(subtitles)
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+
+            on_completed(output_path)
+            return True
+
+        except Exception as e:
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+            on_failed(str(e))
+            return False
+
+    def execute_chatgpt_batch_job(self, job) -> bool:
+        """Execute single ChatGPT translation job."""
+        try:
+            if not OPENAI_AVAILABLE:
+                on_failed = job.config.get('_on_failed')
+                if on_failed:
+                    on_failed("OpenAI library not installed")
+                return False
+
+            on_progress = job.config.get('_on_progress', lambda *args: None)
+            on_completed = job.config.get('_on_completed', lambda *args: None)
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+
+            api_key = job.config.get('api_key', '')
+            model = job.config.get('model', 'gpt-4-turbo')
+
+            if not api_key:
+                on_failed("API key not provided")
+                return False
+
+            client = OpenAI(api_key=api_key)
+
+            on_progress(20, "Reading SRT file...")
+
+            with open(job.file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            subtitles = SRTParser.parse(content)
+            total = len(subtitles)
+
+            if total == 0:
+                on_failed("No subtitles found in file")
+                return False
+
+            on_progress(30, f"Translating {total} subtitles with ChatGPT...")
+
+            translated_count = 0
+            skipped_count = 0
+
+            for i, subtitle in enumerate(subtitles):
+                text_to_translate = subtitle['text'].strip()
+                
+                if not text_to_translate:
+                    skipped_count += 1
+                elif CodeDetector.is_code_or_technical(text_to_translate):
+                    skipped_count += 1
+                else:
+                    try:
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": ChatGPTTranslateThread.SYSTEM_PROMPT},
+                                {"role": "user", "content": text_to_translate}
+                            ],
+                            temperature=0.3,
+                            max_tokens=500
+                        )
+                        
+                        if response.choices and len(response.choices) > 0:
+                            translated = response.choices[0].message.content.strip()
+                            if translated:
+                                subtitle['text'] = translated
+                                translated_count += 1
+                            else:
+                                skipped_count += 1
+                        else:
+                            skipped_count += 1
+                            
+                    except Exception as e:
+                        on_progress(0, f"⚠ API Error: {str(e)[:80]}")
+                        skipped_count += 1
+
+                progress = 30 + int((i + 1) / total * 65)
+                on_progress(progress, f"Translated {translated_count}, Skipped {skipped_count}")
+
+            on_progress(95, "Saving file...")
+
+            output_path = job.file_path.replace('.srt', '.ar.srt')
+            output_content = SRTParser.format(subtitles)
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+
+            on_completed(output_path)
+            return True
+
+        except Exception as e:
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+            on_failed(str(e))
+            return False
 
     def select_video(self):
         """Select video file for Whisper translation."""

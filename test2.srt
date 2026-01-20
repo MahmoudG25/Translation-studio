@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:05,000
+Good morning everyone!
+
+2
+00:00:06,000 --> 00:00:10,000
+This is the second test file.
+
+3
+00:00:11,000 --> 00:00:15,000
+Batch translation test number two.

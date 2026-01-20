@@ -63,7 +63,7 @@ sudo apt-get install ffmpeg
 
 #### 2. Clone or Download the Repository
 ```bash
-git clone https://github.com/yourusername/translation-studio.git
+git clone https://github.com/MahmoudG25/translation-studio.git
 cd translation-studio
 ```
 

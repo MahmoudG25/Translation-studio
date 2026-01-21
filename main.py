@@ -24,7 +24,7 @@ from PySide6.QtGui import QFont, QColor
 
 # Try importing optional libraries with graceful fallbacks
 try:
-    import whisper
+    from faster_whisper import WhisperModel
     WHISPER_AVAILABLE = True
 except ImportError:
     WHISPER_AVAILABLE = False
@@ -233,28 +233,38 @@ class FFmpegHandler:
 # ===================== TRANSLATION THREADS =====================
 
 class WhisperTranslateThread(QThread):
-    """Translate video/audio to Arabic SRT using Whisper (Offline)."""
+    """Extract text from video/audio to SRT using Faster-Whisper (Offline)."""
     
     status_update = Signal(str)
     progress_update = Signal(int)
     translation_finished = Signal(str)
 
-    def __init__(self, video_path: str, model: str = "medium"):
+    def __init__(self, video_path: str, model: str = "medium", extract_only: bool = True, target_lang: str = "ar", api_key: str = "", engine: str = "openai"):
         super().__init__()
         self.video_path = video_path
         self.model_name = model
+        self.extract_only = extract_only
+        self.target_lang = target_lang
+        self.api_key = api_key
+        self.engine = engine  # 'openai' or 'argos'
         self.model = None
 
     def run(self):
-        """Execute translation in background."""
+        """Execute extraction and optional translation in background."""
         try:
             if not WHISPER_AVAILABLE:
-                self.translation_finished.emit("Error: Whisper not installed. Run: pip install openai-whisper")
+                self.translation_finished.emit("Error: faster-whisper not installed. Run: pip install faster-whisper")
                 return
 
-            self.status_update.emit("Loading Whisper model...")
+            self.status_update.emit(f"Loading Faster-Whisper model ({self.model_name})...")
             self.progress_update.emit(10)
-            self.model = whisper.load_model(self.model_name)
+            
+            # Use GPU if available, else CPU
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+            
+            self.model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
 
             # Extract audio from video
             self.status_update.emit("Extracting audio from video...")
@@ -264,108 +274,114 @@ class WhisperTranslateThread(QThread):
             FFmpegHandler.extract_audio(self.video_path, audio_path)
 
             try:
-                # Transcribe with Whisper
-                self.status_update.emit("Transcribing audio with Whisper...")
+                # Transcribe with Faster-Whisper
+                self.status_update.emit("Transcribing audio with Faster-Whisper...")
                 self.progress_update.emit(40)
 
-                result = self.model.transcribe(
-                    audio_path,
-                    language="en",
-                    task="transcribe"
-                )
-
-                # Convert Whisper output to SRT format and translate to Arabic
-                self.status_update.emit("Converting to SRT and translating to Arabic...")
-                self.progress_update.emit(50)
-
-                srt_content = self._format_whisper_output(result)
+                segments, info = self.model.transcribe(audio_path, beam_size=5)
                 
-                # Parse the SRT content to get segments
-                subtitles = SRTParser.parse(srt_content)
-                total = len(subtitles)
-
-                if total > 0:
-                    self.status_update.emit(f"Translating {total} segments to Arabic...")
-                    self.progress_update.emit(60)
+                # Convert to SRT format list
+                srt_segments = []
+                for i, segment in enumerate(segments):
+                    srt_segments.append({
+                        'index': str(i + 1),
+                        'timestamp': f"{self._seconds_to_srt_time(segment.start)} --> {self._seconds_to_srt_time(segment.end)}",
+                        'text': segment.text.strip()
+                    })
                     
-                    # Translate each subtitle to Arabic using Argos if available
-                    if ARGOS_AVAILABLE:
+                total = len(srt_segments)
+                if total == 0:
+                    self.translation_finished.emit("✗ Error: No speech detected")
+                    return
+
+                # If extract_only is True, we just save the original language SRT
+                if self.extract_only:
+                    self.status_update.emit("Saving original text SRT...")
+                    self.progress_update.emit(90)
+                    srt_content = SRTParser.format(srt_segments)
+                    output_path = os.path.splitext(self.video_path)[0] + ".srt"
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                    self.progress_update.emit(100)
+                    self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Extracted: {total} segments)")
+                    return
+
+                # If not extract_only, we translate to Arabic
+                if self.engine == "openai":
+                    self.status_update.emit(f"Translating {total} segments to Arabic using OpenAI...")
+                    self.progress_update.emit(50)
+                    
+                    if not self.api_key:
+                        self.translation_finished.emit("✗ Error: OpenAI API key required")
+                        return
+
+                    from openai import OpenAI
+                    client = OpenAI(api_key=self.api_key)
+                    
+                    for i, segment in enumerate(srt_segments):
                         try:
-                            # Try to ensure language packages are downloaded
-                            try:
-                                package.update_package_index()
-                            except Exception:
-                                pass  # Ignore if this fails
-                            
-                            translated_count = 0
-                            for i, subtitle in enumerate(subtitles):
-                                if not CodeDetector.is_code_or_technical(subtitle['text']):
-                                    try:
-                                        original_text = subtitle['text']
-                                        translated = translate.translate(subtitle['text'], "en", "ar")
-                                        # Validate that translation is not empty
-                                        if translated and len(translated.strip()) > 0:
-                                            subtitle['text'] = translated
-                                            translated_count += 1
-                                        else:
-                                            # Keep original if translation resulted in empty text
-                                            self.status_update.emit(f"⚠ Subtitle {i+1}: Translation resulted in empty, kept original")
-                                    except Exception as e:
-                                        # Keep original if translation fails
-                                        self.status_update.emit(f"⚠ Subtitle {i+1} translation error: {str(e)[:50]}")
-                                
-                                progress = 60 + int((i + 1) / total * 20)
-                                self.progress_update.emit(progress)
-                            self.status_update.emit(f"✓ Translated {translated_count}/{total} subtitles to Arabic")
+                            response = client.chat.completions.create(
+                                model="gpt-4o-mini",
+                                messages=[
+                                    {"role": "system", "content": ChatGPTTranslateThread.SYSTEM_PROMPT},
+                                    {"role": "user", "content": segment['text']}
+                                ],
+                                temperature=0.3
+                            )
+                            segment['text'] = response.choices[0].message.content.strip()
                         except Exception as e:
-                            self.status_update.emit(f"⚠ Translation to Arabic unavailable: {str(e)}")
-                    else:
-                        self.status_update.emit("⚠ Argos Translate not installed. Subtitles will remain in English.")
-                        self.status_update.emit("   Run: pip install argostranslate")
+                            self.status_update.emit(f"⚠ Segment {i+1} error: {str(e)[:50]}")
+                        
+                        progress = 50 + int((i + 1) / total * 40)
+                        self.progress_update.emit(progress)
+                
+                else:  # Argos (Offline)
+                    self.status_update.emit(f"Translating {total} segments to Arabic using Argos (Offline)...")
+                    self.progress_update.emit(50)
                     
-                    srt_content = SRTParser.format(subtitles)
+                    if not ARGOS_AVAILABLE:
+                        self.translation_finished.emit("✗ Error: Argos Translate not installed")
+                        return
 
-                # Save SRT file
-                self.status_update.emit("Saving SRT file...")
-                self.progress_update.emit(90)
+                    try:
+                        package.update_package_index()
+                    except:
+                        pass
+                    
+                    for i, segment in enumerate(srt_segments):
+                        if not CodeDetector.is_code_or_technical(segment['text']):
+                            try:
+                                translated = translate.translate(segment['text'], "en", "ar")
+                                if translated and translated.strip():
+                                    segment['text'] = translated
+                            except Exception as e:
+                                self.status_update.emit(f"⚠ Segment {i+1} error: {str(e)[:50]}")
+                        
+                        progress = 50 + int((i + 1) / total * 40)
+                        self.progress_update.emit(progress)
 
+                # Save translated SRT
+                self.status_update.emit("Saving translated SRT file...")
+                self.progress_update.emit(95)
+
+                srt_content = SRTParser.format(srt_segments)
                 output_path = os.path.splitext(self.video_path)[0] + ".ar.srt"
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(srt_content)
 
                 self.progress_update.emit(100)
-                translated_segments = SRTParser.parse(srt_content)
-                # Count translated segments (non-empty)
-                translated_count = sum(1 for s in translated_segments if s['text'].strip())
-                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Translated: {translated_count}/{total})")
+                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Translated: {total} segments)")
 
             finally:
                 # Cleanup temporary audio file
                 if os.path.exists(audio_path):
-                    os.remove(audio_path)
+                    try:
+                        os.remove(audio_path)
+                    except:
+                        pass
 
         except Exception as e:
             self.translation_finished.emit(f"✗ Error: {str(e)}")
-
-    @staticmethod
-    def _format_whisper_output(result: Dict) -> str:
-        """Convert Whisper JSON output to SRT format."""
-        srt_lines = []
-        index = 1
-
-        for segment in result.get('segments', []):
-            start_time = WhisperTranslateThread._seconds_to_srt_time(segment['start'])
-            end_time = WhisperTranslateThread._seconds_to_srt_time(segment['end'])
-            text = segment['text'].strip()
-
-            if text:
-                srt_lines.append(str(index))
-                srt_lines.append(f"{start_time} --> {end_time}")
-                srt_lines.append(text)
-                srt_lines.append('')
-                index += 1
-
-        return '\n'.join(srt_lines)
 
     @staticmethod
     def _seconds_to_srt_time(seconds: float) -> str:
@@ -645,51 +661,73 @@ class TranslatorApp(QWidget):
         single_widget = QWidget()
         single_layout = QVBoxLayout()
         
-        # Video Translation Section
-        video_title = QLabel("🎥 VIDEO/AUDIO TRANSLATION (Whisper - Offline)")
+        # Video Processing Section
+        video_title = QLabel("🎥 VIDEO/AUDIO PROCESSING (Faster-Whisper)")
         video_title.setFont(QFont("Arial", 11, QFont.Bold))
         single_layout.addWidget(video_title)
 
         video_layout = QHBoxLayout()
-        self.video_btn = QPushButton("Select Video File")
-        self.video_btn.clicked.connect(self.select_video)
-        self.video_model_combo = QComboBox()
-        self.video_model_combo.addItems(["medium", "large"])
-        video_layout.addWidget(self.video_btn)
-        video_layout.addWidget(QLabel("Model:"))
-        video_layout.addWidget(self.video_model_combo)
+        self.video_extract_btn = QPushButton("Text Extraction Only (Offline)")
+        self.video_extract_btn.clicked.connect(lambda: self.process_video(extract_only=True))
+        
+        self.video_translate_btn = QPushButton("Translate to Arabic (Online - OpenAI)")
+        self.video_translate_btn.clicked.connect(lambda: self.process_video(extract_only=False, engine="openai"))
+        self.video_translate_btn.setStyleSheet("background-color: #2a5298; color: white; font-weight: bold;")
+
+        self.video_offline_btn = QPushButton("Translate to Arabic (Offline - Argos)")
+        self.video_offline_btn.clicked.connect(lambda: self.process_video(extract_only=False, engine="argos"))
+        self.video_offline_btn.setStyleSheet("background-color: #4b6cb7; color: white;")
+        
+        video_layout.addWidget(self.video_extract_btn)
+        video_layout.addWidget(self.video_translate_btn)
+        video_layout.addWidget(self.video_offline_btn)
         single_layout.addLayout(video_layout)
 
-        # SRT Translation Section - Argos
+        model_layout = QHBoxLayout()
+        self.video_model_combo = QComboBox()
+        self.video_model_combo.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.video_model_combo.setCurrentText("medium")
+        model_layout.addWidget(QLabel("Whisper Model:"))
+        model_layout.addWidget(self.video_model_combo)
+        model_layout.addStretch()
+        single_layout.addLayout(model_layout)
+
+        # Existing SRT Translation Section - Argos (Keep as legacy/fallback)
         srt_argos_title = QLabel("📝 SRT TRANSLATION - OFFLINE (Argos Translate)")
-        srt_argos_title.setFont(QFont("Arial", 11, QFont.Bold))
+        srt_argos_title.setFont(QFont("Arial", 10))
+        srt_argos_title.setStyleSheet("color: gray;")
         single_layout.addWidget(srt_argos_title)
 
-        self.srt_argos_btn = QPushButton("Select SRT File (Argos)")
+        self.srt_argos_btn = QPushButton("Legacy SRT Translate (Argos)")
         self.srt_argos_btn.clicked.connect(self.select_srt_argos)
         single_layout.addWidget(self.srt_argos_btn)
 
-        # SRT Translation Section - ChatGPT
-        srt_chatgpt_title = QLabel("📝 SRT TRANSLATION - ONLINE (ChatGPT)")
+        # Updated SRT Translation Section - OpenAI (Main Engine)
+        srt_chatgpt_title = QLabel("📝 SRT TRANSLATION - OPENAI (Main Engine)")
         srt_chatgpt_title.setFont(QFont("Arial", 11, QFont.Bold))
         single_layout.addWidget(srt_chatgpt_title)
 
         srt_chatgpt_layout = QHBoxLayout()
-        self.srt_chatgpt_btn = QPushButton("Select SRT File (ChatGPT)")
+        self.srt_chatgpt_btn = QPushButton("Select SRT File to Translate")
         self.srt_chatgpt_btn.clicked.connect(self.select_srt_chatgpt)
+        self.srt_chatgpt_btn.setStyleSheet("background-color: #2a5298; color: white;")
+        
         self.chatgpt_model_combo = QComboBox()
-        self.chatgpt_model_combo.addItems(["gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"])
+        self.chatgpt_model_combo.addItems(["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"])
         srt_chatgpt_layout.addWidget(self.srt_chatgpt_btn)
         srt_chatgpt_layout.addWidget(QLabel("Model:"))
         srt_chatgpt_layout.addWidget(self.chatgpt_model_combo)
         single_layout.addLayout(srt_chatgpt_layout)
 
         # API Key input
-        self.api_key_label = QLabel("OpenAI API Key:")
+        self.api_key_label = QLabel("OpenAI API Key (Required for Translation):")
         single_layout.addWidget(self.api_key_label)
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.Password)
         self.api_key_input.setPlaceholderText("sk-...")
+        # Load API key from env if available
+        if os.getenv("OPENAI_API_KEY"):
+            self.api_key_input.setText(os.getenv("OPENAI_API_KEY"))
         single_layout.addWidget(self.api_key_input)
 
         single_layout.addStretch()
@@ -1183,6 +1221,39 @@ class TranslatorApp(QWidget):
             on_failed(str(e))
             return False
 
+    def process_video(self, extract_only: bool = True, engine: str = "openai"):
+        """Select and process video file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            "",
+            "Video Files (*.mp4 *.mkv *.avi *.mov *.webm);;All Files (*)"
+        )
+
+        if file_path:
+            api_key = self.api_key_input.text().strip()
+            if not extract_only and engine == "openai" and not api_key:
+                self.log_area.append("[OpenAI] ✗ Error: API key required for online translation")
+                return
+
+            model = self.video_model_combo.currentText()
+            mode_name = "Extraction" if extract_only else f"Translation ({engine.upper()})"
+            self.log_area.append(f"[Video] Selected: {os.path.basename(file_path)}")
+            self.log_area.append(f"[Video] Mode: {mode_name} | Model: {model}")
+            
+            self.disable_ui()
+            self.thread = WhisperTranslateThread(
+                video_path=file_path, 
+                model=model, 
+                extract_only=extract_only,
+                api_key=api_key,
+                engine=engine
+            )
+            self.thread.status_update.connect(self.update_status)
+            self.thread.progress_update.connect(self.update_progress)
+            self.thread.translation_finished.connect(self.on_translation_finished)
+            self.thread.start()
+
     def select_video(self):
         """Select video file for Whisper translation."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1248,7 +1319,9 @@ class TranslatorApp(QWidget):
 
     def disable_ui(self):
         """Disable UI during translation."""
-        self.video_btn.setEnabled(False)
+        self.video_extract_btn.setEnabled(False)
+        self.video_translate_btn.setEnabled(False)
+        self.video_offline_btn.setEnabled(False)
         self.video_model_combo.setEnabled(False)
         self.srt_argos_btn.setEnabled(False)
         self.srt_chatgpt_btn.setEnabled(False)
@@ -1257,7 +1330,9 @@ class TranslatorApp(QWidget):
 
     def enable_ui(self):
         """Enable UI after translation."""
-        self.video_btn.setEnabled(True)
+        self.video_extract_btn.setEnabled(True)
+        self.video_translate_btn.setEnabled(True)
+        self.video_offline_btn.setEnabled(True)
         self.video_model_combo.setEnabled(True)
         self.srt_argos_btn.setEnabled(True)
         self.srt_chatgpt_btn.setEnabled(True)

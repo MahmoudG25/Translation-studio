@@ -17,7 +17,7 @@ from typing import List, Dict, Tuple
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QProgressBar, QComboBox, QLineEdit, QTextEdit, QListWidget,
-    QListWidgetItem, QSpinBox, QTabWidget
+    QListWidgetItem, QSpinBox, QTabWidget, QCheckBox
 )
 from PySide6.QtCore import QThread, Signal, Qt, QTimer
 from PySide6.QtGui import QFont, QColor
@@ -203,10 +203,14 @@ class FFmpegHandler:
 
             cmd = [
                 'ffmpeg',
-                '-y',  # Overwrite output file
+                '-y',
+                '-err_detect', 'ignore_err',  # Ignore decoding errors
                 '-i', video_path,
-                '-ar', '16000',  # Sample rate for Whisper
-                '-ac', '1',  # Mono audio
+                '-vn',
+                '-ar', '16000',
+                '-af', 'pan=mono|c0=c0',  # Force use of first channel only
+                '-c:a', 'pcm_s16le',
+                '-ac', '1',
                 output_audio_path
             ]
 
@@ -215,7 +219,7 @@ class FFmpegHandler:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=600  # 10 minute timeout
+                timeout=3600  # 1 hour timeout for large files
             )
 
             if result.returncode != 0:
@@ -239,10 +243,11 @@ class WhisperTranslateThread(QThread):
     progress_update = Signal(int)
     translation_finished = Signal(str)
 
-    def __init__(self, video_path: str, model: str = "medium"):
+    def __init__(self, video_path: str, model: str = "medium", extract_only: bool = False):
         super().__init__()
         self.video_path = video_path
         self.model_name = model
+        self.extract_only = extract_only
         self.model = None
 
     def run(self):
@@ -265,13 +270,19 @@ class WhisperTranslateThread(QThread):
 
             try:
                 # Transcribe with Whisper
-                self.status_update.emit("Transcribing audio with Whisper...")
-                self.progress_update.emit(40)
+                # Configure Whisper task based on mode
+                if self.extract_only:
+                    # Original language extraction (Auto-detect language)
+                    transcribe_options = {"task": "transcribe"}
+                    self.status_update.emit("Transcribing audio (Auto-detecting language)...")
+                else:
+                    # Translate to English first (Whisper only translates to English), then Argos does En->Ar
+                    transcribe_options = {"task": "translate"}
+                    self.status_update.emit("Transcribing and translating to English (for conversion)...")
 
                 result = self.model.transcribe(
                     audio_path,
-                    language="en",
-                    task="transcribe"
+                    **transcribe_options
                 )
 
                 # Convert Whisper output to SRT format and translate to Arabic
@@ -285,51 +296,70 @@ class WhisperTranslateThread(QThread):
                 total = len(subtitles)
 
                 if total > 0:
-                    self.status_update.emit(f"Translating {total} segments to Arabic...")
-                    self.progress_update.emit(60)
-                    
-                    # Translate each subtitle to Arabic using Argos if available
-                    if ARGOS_AVAILABLE:
-                        try:
-                            # Try to ensure language packages are downloaded
-                            try:
-                                package.update_package_index()
-                            except Exception:
-                                pass  # Ignore if this fails
-                            
-                            translated_count = 0
-                            for i, subtitle in enumerate(subtitles):
-                                if not CodeDetector.is_code_or_technical(subtitle['text']):
-                                    try:
-                                        original_text = subtitle['text']
-                                        translated = translate.translate(subtitle['text'], "en", "ar")
-                                        # Validate that translation is not empty
-                                        if translated and len(translated.strip()) > 0:
-                                            subtitle['text'] = translated
-                                            translated_count += 1
-                                        else:
-                                            # Keep original if translation resulted in empty text
-                                            self.status_update.emit(f"⚠ Subtitle {i+1}: Translation resulted in empty, kept original")
-                                    except Exception as e:
-                                        # Keep original if translation fails
-                                        self.status_update.emit(f"⚠ Subtitle {i+1} translation error: {str(e)[:50]}")
-                                
-                                progress = 60 + int((i + 1) / total * 20)
-                                self.progress_update.emit(progress)
-                            self.status_update.emit(f"✓ Translated {translated_count}/{total} subtitles to Arabic")
-                        except Exception as e:
-                            self.status_update.emit(f"⚠ Translation to Arabic unavailable: {str(e)}")
+                    if self.extract_only:
+                        self.status_update.emit(f"✓ Extracted {total} segments (Original Language)")
+                        self.progress_update.emit(80)
                     else:
-                        self.status_update.emit("⚠ Argos Translate not installed. Subtitles will remain in English.")
-                        self.status_update.emit("   Run: pip install argostranslate")
-                    
-                    srt_content = SRTParser.format(subtitles)
+                        self.status_update.emit(f"Translating {total} segments to Arabic...")
+                        self.progress_update.emit(60)
+                        
+                        # Translate each subtitle to Arabic using Argos if available
+                        if ARGOS_AVAILABLE:
+                            try:
+                                # Try to ensure language packages are downloaded
+                                try:
+                                    package.update_package_index()
+                                except Exception:
+                                    pass  # Ignore if this fails
+                                
+                                translated_count = 0
+                                for i, subtitle in enumerate(subtitles):
+                                    if not CodeDetector.is_code_or_technical(subtitle['text']):
+                                        try:
+                                            original_text = subtitle['text']
+                                            translated = translate.translate(subtitle['text'], "en", "ar")
+                                            # Validate that translation is not empty
+                                            if translated and len(translated.strip()) > 0:
+                                                subtitle['text'] = translated
+                                                translated_count += 1
+                                            else:
+                                                # Keep original if translation resulted in empty text
+                                                self.status_update.emit(f"⚠ Subtitle {i+1}: Translation resulted in empty, kept original")
+                                        except Exception as e:
+                                            # Keep original if translation fails
+                                            self.status_update.emit(f"⚠ Subtitle {i+1} translation error: {str(e)[:50]}")
+                                    
+                                    progress = 60 + int((i + 1) / total * 20)
+                                    self.progress_update.emit(progress)
+                                self.status_update.emit(f"✓ Translated {translated_count}/{total} subtitles to Arabic")
+                            except Exception as e:
+                                self.status_update.emit(f"⚠ Translation to Arabic unavailable: {str(e)}")
+                        else:
+                            self.status_update.emit("⚠ Argos Translate not installed. Subtitles will remain in English.")
+                            self.status_update.emit("   Run: pip install argostranslate")
+                        
+                        srt_content = SRTParser.format(subtitles)
 
                 # Save SRT file
                 self.status_update.emit("Saving SRT file...")
                 self.progress_update.emit(90)
 
-                output_path = os.path.splitext(self.video_path)[0] + ".ar.srt"
+                # Get detected language if available
+                detected_lang = result.get('language', 'original')
+                
+                # Output filename logic:
+                # If extract_only: use detected language (e.g. "video en.srt", "video fr.srt")
+                # If translation: forced to "ar" (e.g. "video ar.srt")
+                suffix = detected_lang if self.extract_only else "ar"
+                
+                # Create 'subs' folder if it doesn't exist
+                source_dir = os.path.dirname(self.video_path)
+                output_dir = os.path.join(source_dir, "subs")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                base_name = os.path.splitext(os.path.basename(self.video_path))[0]
+                output_path = os.path.join(output_dir, f"{base_name} {suffix}.srt")
+
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(srt_content)
 
@@ -337,7 +367,7 @@ class WhisperTranslateThread(QThread):
                 translated_segments = SRTParser.parse(srt_content)
                 # Count translated segments (non-empty)
                 translated_count = sum(1 for s in translated_segments if s['text'].strip())
-                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} (Translated: {translated_count}/{total})")
+                self.translation_finished.emit(f"✓ Done: {os.path.basename(output_path)} ({'Extracted' if self.extract_only else 'Translated'}: {translated_count}/{total})")
 
             finally:
                 # Cleanup temporary audio file
@@ -654,11 +684,15 @@ class TranslatorApp(QWidget):
         self.video_btn = QPushButton("Select Video File")
         self.video_btn.clicked.connect(self.select_video)
         self.video_model_combo = QComboBox()
-        self.video_model_combo.addItems(["medium", "large"])
+        self.video_model_combo.addItems(["tiny", "base", "small", "medium", "large"])
+        
+        self.extract_only_check = QCheckBox("Extract Original Language Only")
+        
         video_layout.addWidget(self.video_btn)
         video_layout.addWidget(QLabel("Model:"))
         video_layout.addWidget(self.video_model_combo)
         single_layout.addLayout(video_layout)
+        single_layout.addWidget(self.extract_only_check)
 
         # SRT Translation Section - Argos
         srt_argos_title = QLabel("📝 SRT TRANSLATION - OFFLINE (Argos Translate)")
@@ -709,10 +743,29 @@ class TranslatorApp(QWidget):
         engine_layout = QHBoxLayout()
         engine_layout.addWidget(QLabel("Select Engine:"))
         self.batch_engine_combo = QComboBox()
-        self.batch_engine_combo.addItems(["Argos (Offline)", "ChatGPT (Online)"])
+        self.batch_engine_combo.addItems(["Whisper (Offline)", "Argos (Offline)", "ChatGPT (Online)"])
         engine_layout.addWidget(self.batch_engine_combo)
         engine_layout.addStretch()
         batch_layout.addLayout(engine_layout)
+
+        # Whisper model selection (shown when Whisper selected)
+        self.batch_whisper_widget = QWidget()
+        batch_whisper_layout = QVBoxLayout()
+        
+        whisper_model_layout = QHBoxLayout()
+        whisper_model_layout.addWidget(QLabel("Whisper Model:"))
+        self.batch_whisper_model_combo = QComboBox()
+        self.batch_whisper_model_combo.addItems(["tiny", "base", "small", "medium", "large"])
+        self.batch_whisper_model_combo.setCurrentText("base")
+        whisper_model_layout.addWidget(self.batch_whisper_model_combo)
+        whisper_model_layout.addStretch()
+        batch_whisper_layout.addLayout(whisper_model_layout)
+        
+        self.batch_extract_only_check = QCheckBox("Extract Original Language Only (No Translation)")
+        batch_whisper_layout.addWidget(self.batch_extract_only_check)
+        
+        self.batch_whisper_widget.setLayout(batch_whisper_layout)
+        batch_layout.addWidget(self.batch_whisper_widget)
 
         # ChatGPT model selection (shown when ChatGPT selected)
         self.batch_chatgpt_model_widget = QWidget()
@@ -741,7 +794,7 @@ class TranslatorApp(QWidget):
         parallel_layout.addWidget(QLabel("Parallel Jobs:"))
         self.parallel_jobs_spin = QSpinBox()
         self.parallel_jobs_spin.setMinimum(1)
-        self.parallel_jobs_spin.setMaximum(4)
+        self.parallel_jobs_spin.setMaximum(20)
         self.parallel_jobs_spin.setValue(2)
         parallel_layout.addWidget(self.parallel_jobs_spin)
         parallel_layout.addStretch()
@@ -749,7 +802,7 @@ class TranslatorApp(QWidget):
 
         # File selection buttons
         file_button_layout = QHBoxLayout()
-        self.batch_select_files_btn = QPushButton("📂 Select SRT Files")
+        self.batch_select_files_btn = QPushButton("📂 Select Files")
         self.batch_select_files_btn.clicked.connect(self.batch_select_files)
         file_button_layout.addWidget(self.batch_select_files_btn)
 
@@ -808,22 +861,46 @@ class TranslatorApp(QWidget):
 
     def update_batch_ui(self):
         """Update batch UI based on selected engine."""
-        is_chatgpt = "ChatGPT" in self.batch_engine_combo.currentText()
+        engine = self.batch_engine_combo.currentText()
+        is_chatgpt = "ChatGPT" in engine
+        is_whisper = "Whisper" in engine
+        
         self.batch_chatgpt_model_widget.setVisible(is_chatgpt)
         self.batch_api_key_label.setVisible(is_chatgpt)
         self.batch_api_key_input.setVisible(is_chatgpt)
+        self.batch_whisper_widget.setVisible(is_whisper)
+        
+        if is_whisper:
+            self.batch_select_files_btn.setText("📂 Select Video Files")
+        else:
+            self.batch_select_files_btn.setText("📂 Select SRT Files")
 
     def batch_select_files(self):
-        """Select multiple SRT files for batch processing."""
+        """Select multiple files for batch processing."""
+        is_whisper = "Whisper" in self.batch_engine_combo.currentText()
+        
+        if is_whisper:
+            caption = "Select Video Files for Processing"
+            filter_str = "Video Files (*.mp4 *.mkv *.avi *.mov *.webm);;All Files (*)"
+        else:
+            caption = "Select SRT Files for Batch Processing"
+            filter_str = "SRT Files (*.srt);;All Files (*)"
+
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select SRT Files for Batch Processing",
+            caption,
             "",
-            "SRT Files (*.srt);;All Files (*)"
+            filter_str
         )
 
         if file_paths:
-            engine = "chatgpt" if "ChatGPT" in self.batch_engine_combo.currentText() else "argos"
+            selection = self.batch_engine_combo.currentText()
+            if "ChatGPT" in selection:
+                engine = "chatgpt"
+            elif "Whisper" in selection:
+                engine = "whisper"
+            else:
+                engine = "argos"
             
             config = {}
             if engine == "chatgpt":
@@ -833,12 +910,20 @@ class TranslatorApp(QWidget):
                     return
                 config["api_key"] = api_key
                 config["model"] = self.batch_chatgpt_model_combo.currentText()
+            elif engine == "whisper":
+                config["model"] = self.batch_whisper_model_combo.currentText()
+                config["extract_only"] = self.batch_extract_only_check.isChecked()
 
             # Create translation jobs
             from batch_processor import TranslationEngineType as EngineType
             
             self.batch_jobs = []
-            engine_type = EngineType.CHATGPT if engine == "chatgpt" else EngineType.ARGOS
+            if engine == "chatgpt":
+                engine_type = EngineType.CHATGPT
+            elif engine == "whisper":
+                engine_type = EngineType.WHISPER
+            else:
+                engine_type = EngineType.ARGOS
             
             for file_path in file_paths:
                 if os.path.exists(file_path):
@@ -905,9 +990,12 @@ class TranslatorApp(QWidget):
         self.log_area.append(f"[Batch] ▶️ Starting translation of {len(self.batch_jobs)} file(s)...")
 
         # Determine which executor to use
+        # Determine which executor to use
         engine_text = self.batch_engine_combo.currentText()
         if "ChatGPT" in engine_text:
             executor = self.execute_chatgpt_batch_job
+        elif "Whisper" in engine_text:
+            executor = self.execute_whisper_batch_job
         else:
             executor = self.execute_argos_batch_job
 
@@ -1031,6 +1119,123 @@ class TranslatorApp(QWidget):
         # Redirect to new handler for backward compatibility
         self.on_batch_finished(final_stats)
 
+    def execute_whisper_batch_job(self, job) -> bool:
+        """Execute single Whisper translation job."""
+        try:
+            if not WHISPER_AVAILABLE:
+                on_failed = job.config.get('_on_failed')
+                if on_failed:
+                    on_failed("Whisper not installed")
+                return False
+
+            on_progress = job.config.get('_on_progress', lambda *args: None)
+            on_completed = job.config.get('_on_completed', lambda *args: None)
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+
+            model_name = job.config.get('model', 'medium')
+            extract_only = job.config.get('extract_only', False)
+
+            on_progress(10, f"Loading Whisper model ({model_name})...")
+            model = whisper.load_model(model_name)
+
+            # Extract audio
+            on_progress(20, "Extracting audio...")
+            audio_path = os.path.splitext(job.file_path)[0] + "_temp_audio.wav"
+            
+            try:
+                FFmpegHandler.extract_audio(job.file_path, audio_path)
+            except Exception as e:
+                on_failed(f"Audio extraction failed: {str(e)}")
+                return False
+
+            try:
+                # Transcribe
+                # Transcribe
+                if extract_only:
+                    on_progress(40, "Transcribing (Original Language)...")
+                    transcribe_options = {"task": "transcribe"}
+                else:
+                    on_progress(40, "Transcribing & Translating to English...")
+                    transcribe_options = {"task": "translate"}
+
+                result = model.transcribe(
+                    audio_path,
+                    **transcribe_options
+                )
+
+                on_progress(50, "Converting output...")
+                srt_content = WhisperTranslateThread._format_whisper_output(result)
+                subtitles = SRTParser.parse(srt_content)
+                total = len(subtitles)
+
+                if total > 0:
+                    if extract_only:
+                        on_progress(80, f"Extracted {total} segments")
+                    else:
+                        on_progress(60, f"Translating {total} segments to Arabic...")
+                        
+                        if ARGOS_AVAILABLE:
+                            try:
+                                try:
+                                    package.update_package_index()
+                                except Exception:
+                                    pass
+                                
+                                translated_count = 0
+                                for i, subtitle in enumerate(subtitles):
+                                    if not CodeDetector.is_code_or_technical(subtitle['text']):
+                                        try:
+                                            translated = translate.translate(subtitle['text'], "en", "ar")
+                                            if translated and len(translated.strip()) > 0:
+                                                subtitle['text'] = translated
+                                                translated_count += 1
+                                        except Exception:
+                                            pass
+                                    
+                                    progress = 60 + int((i + 1) / total * 20)
+                                    on_progress(progress, f"Translated {i+1}/{total}")
+                            except Exception as e:
+                                on_progress(60, f"Translation unavailable: {str(e)}")
+                        
+                        srt_content = SRTParser.format(subtitles)
+
+                on_progress(90, "Saving file...")
+                
+                # Get detected language if available
+                detected_lang = result.get('language', 'original')
+                
+                # Output filename logic:
+                # If extract_only: use detected language (e.g. "video en.srt")
+                # If translation: forced to "ar" as that's the pipeline
+                suffix = detected_lang if extract_only else "ar"
+
+                # Output filename as requested
+                # Create 'subs' folder if it doesn't exist
+                source_dir = os.path.dirname(job.file_path)
+                output_dir = os.path.join(source_dir, "subs")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                base_name = os.path.splitext(os.path.basename(job.file_path))[0]
+                output_path = os.path.join(output_dir, f"{base_name} {suffix}.srt")
+
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+
+                on_completed(output_path)
+                return True
+
+            finally:
+                if os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except:
+                        pass
+
+        except Exception as e:
+            on_failed = job.config.get('_on_failed', lambda *args: None)
+            on_failed(str(e))
+            return False
+
     def execute_argos_batch_job(self, job) -> bool:
         """Execute single Argos translation job."""
         try:
@@ -1078,7 +1283,14 @@ class TranslatorApp(QWidget):
 
             on_progress(95, "Saving file...")
 
-            output_path = job.file_path.replace('.srt', '.ar.srt')
+            # Output filename as requested: [original] trans.srt
+            # Create 'subs' folder
+            source_dir = os.path.dirname(job.file_path)
+            output_dir = os.path.join(source_dir, "subs")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            base_name = os.path.splitext(os.path.basename(job.file_path))[0]
+            output_path = os.path.join(output_dir, f"{base_name} en.srt")
             output_content = SRTParser.format(subtitles)
 
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -1169,7 +1381,14 @@ class TranslatorApp(QWidget):
 
             on_progress(95, "Saving file...")
 
-            output_path = job.file_path.replace('.srt', '.ar.srt')
+            # Output filename as requested: [original] trans.srt
+            # Create 'subs' folder
+            source_dir = os.path.dirname(job.file_path)
+            output_dir = os.path.join(source_dir, "subs")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            base_name = os.path.splitext(os.path.basename(job.file_path))[0]
+            output_path = os.path.join(output_dir, f"{base_name} trans.srt")
             output_content = SRTParser.format(subtitles)
 
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -1194,10 +1413,12 @@ class TranslatorApp(QWidget):
 
         if file_path:
             model = self.video_model_combo.currentText()
+            extract_only = self.extract_only_check.isChecked()
+            
             self.log_area.append(f"[Video] Selected: {os.path.basename(file_path)}")
-            self.log_area.append(f"[Video] Model: {model}")
+            self.log_area.append(f"[Video] Model: {model} | Extract Only: {extract_only}")
             self.disable_ui()
-            self.thread = WhisperTranslateThread(file_path, model)
+            self.thread = WhisperTranslateThread(file_path, model, extract_only)
             self.thread.status_update.connect(self.update_status)
             self.thread.progress_update.connect(self.update_progress)
             self.thread.translation_finished.connect(self.on_translation_finished)
@@ -1250,6 +1471,7 @@ class TranslatorApp(QWidget):
         """Disable UI during translation."""
         self.video_btn.setEnabled(False)
         self.video_model_combo.setEnabled(False)
+        self.extract_only_check.setEnabled(False)
         self.srt_argos_btn.setEnabled(False)
         self.srt_chatgpt_btn.setEnabled(False)
         self.api_key_input.setEnabled(False)
@@ -1259,6 +1481,7 @@ class TranslatorApp(QWidget):
         """Enable UI after translation."""
         self.video_btn.setEnabled(True)
         self.video_model_combo.setEnabled(True)
+        self.extract_only_check.setEnabled(True)
         self.srt_argos_btn.setEnabled(True)
         self.srt_chatgpt_btn.setEnabled(True)
         self.api_key_input.setEnabled(True)
